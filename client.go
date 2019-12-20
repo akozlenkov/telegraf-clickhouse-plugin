@@ -3,12 +3,14 @@ package clickhouse
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-
+	"github.com/ClickHouse/clickhouse-go"
 	"github.com/influxdata/telegraf"
-	"github.com/juju/errors"
-	"github.com/kshvakov/clickhouse"
+	"log"
+	"net/url"
+	"strconv"
+	"strings"
 )
 
 type ClickhouseClient struct {
@@ -16,15 +18,14 @@ type ClickhouseClient struct {
 	// DBI example: tcp://host1:9000?username=user&password=qwerty&database=clicks&read_timeout=10&write_timeout=20&alt_hosts=host2:9000,host3:9000
 
 	DBI          string
-	Addr         string `toml:"addr"`
-	Port         int64  `toml:"port"`
-	User         string `toml:"user"`
-	Password     string `toml:"password"`
-	Database     string `toml:"database"`
-	TableName    string `toml:"tablename"`
-	WriteTimeout int64  `toml:"write_timeout"`
-
-	Debug bool `toml:"debug"`
+	User         string   `toml:"user"`
+	Password     string   `toml:"password"`
+	Database     string   `toml:"database"`
+	TableName    string   `toml:"tablename"`
+	ReadTimeout  int64    `toml:"read_timeout"`
+	WriteTimeout int64    `toml:"write_timeout"`
+	Hosts        []string `toml:"hosts"`
+	Debug        bool     `toml:"debug"`
 
 	db *sql.DB
 }
@@ -36,14 +37,12 @@ func newClickhouse() *ClickhouseClient {
 func (c *ClickhouseClient) Connect() error {
 	var err error
 
-	c.DBI = fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&write_timeout=%d&debug=%t",
-		c.Addr,
-		c.Port,
-		c.User,
-		c.Password,
-		c.WriteTimeout,
-		c.Debug,
-	)
+	u, err := buildDsn(c)
+	if err != nil {
+		return err
+	}
+
+	c.DBI = u
 
 	if c.Debug {
 		log.Println("DBI=", c.DBI)
@@ -51,7 +50,7 @@ func (c *ClickhouseClient) Connect() error {
 
 	c.db, err = sql.Open("clickhouse", c.DBI)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	return nil
@@ -67,26 +66,24 @@ func (c *ClickhouseClient) Description() string {
 
 func (c *ClickhouseClient) SampleConfig() string {
 	return `
-Schema:
-> CREATE TABLE telegraf.metrics(
-	date Date DEFAULT toDate(ts),
-	name String,
-	tags String,
-	val Float64,
-	ts DateTime,
-	updated DateTime DEFAULT now()
-) ENGINE=MergeTree(date,(name,tags,ts),8192)
+# Schema:
+# CREATE TABLE telegraf.metrics(
+# 	date Date DEFAULT toDate(ts),
+#	name String,
+#	tags String,
+#	val Float64,
+#	ts DateTime,
+#	updated DateTime DEFAULT now()
+# ) ENGINE=MergeTree(date,(name,tags,ts),8192)
 
-telegraf.conf
-[[outputs.clickhouse]]
-    user = "default"
-    password = ""
-    addr = 127.0.0.1
-    port = 9000
-    database = "telegraf"
-	tablename = "metrics"
-	write_timeout = 10
-	debug = true
+  user = "default"
+  password = ""
+  database = "telegraf"
+  tablename = "metrics"
+  read_timeout = 10
+  write_timeout = 10
+  hosts = [ "127.0.0.1:9000" ]
+  debug = false
 `
 }
 
@@ -118,7 +115,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 				log.Println(err)
 			}
 		}
-		return errors.Trace(err)
+		return err
 	}
 
 	// create database
@@ -131,7 +128,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 		if c.Debug {
 			log.Println(err.Error())
 		}
-		return errors.Trace(err)
+		return err
 	}
 
 	// create table
@@ -154,7 +151,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 		if c.Debug {
 			log.Fatal(err.Error())
 		}
-		return errors.Trace(err)
+		return err
 	}
 
 	// start transaction
@@ -166,7 +163,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 		if c.Debug {
 			log.Fatal(err.Error())
 		}
-		return errors.Trace(err)
+		return err
 	}
 
 	// Prepare stmt
@@ -176,7 +173,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 		if c.Debug {
 			log.Println(err.Error())
 		}
-		return errors.Trace(err)
+		return err
 	}
 	defer Stmt.Close()
 
@@ -206,7 +203,7 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 
 	// commit transaction.
 	if err := Tx.Commit(); err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	if c.Debug {
@@ -214,4 +211,26 @@ func (c *ClickhouseClient) Write(metrics []telegraf.Metric) (err error) {
 	}
 
 	return err
+}
+
+func buildDsn(c *ClickhouseClient) (string, error) {
+	v := url.Values{}
+	v.Add("read_timeout", string(c.ReadTimeout))
+	v.Add("write_timeout", string(c.WriteTimeout))
+	v.Add("debug", strconv.FormatBool(c.Debug))
+
+	if len(c.Hosts) == 0 {
+		return "", errors.New("hosts must be set")
+	}
+
+	if len(c.Hosts) > 1 {
+		v.Add("alt_hosts", strings.Join(c.Hosts[1:], ","))
+	}
+
+	u := url.URL{
+		Scheme:   "tcp",
+		Host:     c.Hosts[0],
+		RawQuery: v.Encode(),
+	}
+	return u.String(), nil
 }
